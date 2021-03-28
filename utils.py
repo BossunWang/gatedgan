@@ -10,16 +10,19 @@ from visdom import Visdom
 import numpy as np
 import torch.nn.init
 
+
 def label2tensor(label,tensor):
     for i in range(label.size(0)):
         tensor[i].fill_(label[i])
     return tensor
+
 
 def tensor2image(tensor):
     image = 127.5*(tensor[0].cpu().float().numpy() + 1.0)
     if image.shape[0] == 1:
         image = np.tile(image, (3,1,1))
     return image.astype(np.uint8)
+
 
 def weights_init_normal(m):
     classname = m.__class__.__name__
@@ -43,7 +46,6 @@ class Logger():
         self.losses = {}
         self.loss_windows = {}
         self.image_windows = {}
-
 
     def log(self, losses=None, images=None, category=None):
         
@@ -73,9 +75,6 @@ class Logger():
                 self.image_windows[image_name] = self.viz.image(tensor2image(tensor.data), opts={'title':image_name})
             else:
                 self.viz.image(tensor2image(tensor.data), win=self.image_windows[image_name], opts={'title':image_name})
-                
-
-            
 
         # End of epoch
 #         if True:
@@ -96,7 +95,6 @@ class Logger():
         else:
             self.batch += 1
             
-            
 
 class LambdaLR():
     def __init__(self, n_epochs, offset, decay_start_epoch):
@@ -107,3 +105,24 @@ class LambdaLR():
 
     def step(self, epoch):
         return 1.0 - max(0, epoch + self.offset - self.decay_start_epoch)/(self.n_epochs - self.decay_start_epoch)
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
