@@ -13,9 +13,19 @@ import argparse
 import cv2
 import numpy as np
 from tqdm import tqdm
+from scipy.linalg import block_diag
 
 from models import *
 from utils import *
+
+
+def get_block_diagonal_mask(n_group, n_member):
+    G = n_group
+    ones = np.ones((n_member, n_member)).tolist()
+    mask = block_diag(ones, ones)
+    for i in range(G - 2):
+        mask = block_diag(mask, ones)
+    return torch.from_numpy(mask).float()
 
 
 def toTensor(img, mean, std):
@@ -32,10 +42,14 @@ def toTensor(img, mean, std):
 def test(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # The number of blocks in the coloring matrix: G, The number of elements for each block: n_members^2
+    n_mem = args.content_dim // args.n_group
+    # This is used in generators to make the coloring matrix the block diagonal form.
+    mask = get_block_diagonal_mask(args.n_group, n_mem).to(device)
+
     # models
-    in_nc = 3
-    out_nc = 3
-    generator = Generator(in_nc, out_nc, args.n_styles, args.ngf).to(device)
+    generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
+                          , args.mlp_dim, args.bias_dim, args.content_dim, device).to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
     assert "generator" in checkpoint
@@ -48,6 +62,7 @@ def test(args):
 
     # create label dir
     style_sources = sorted(glob.glob(os.path.join(args.style_dir, 'train', '*')))
+
     style_labels = []
     for style_label in style_sources:
         style_path = os.path.join(args.out_dir, style_label.split('/')[-1])
@@ -75,10 +90,17 @@ def test(args):
             content_tensor = toTensor(content_img, mean_array, std_array).to(device)
 
             for style_index in range(args.n_styles):
+                style_path = os.path.join(args.style_dir, 'train', style_labels[style_index].split('/')[-1])
+                style_files = os.listdir(style_path)
+
+                style_image = cv2.imread(os.path.join(style_path, style_files[0]))
+                style_tensor = toTensor(style_image, mean_array, std_array).to(device)
                 style_index = torch.tensor(style_index)
+
                 style_OHE = F.one_hot(style_index, args.n_styles).unsqueeze(0).long().to(device)
-                input_dict = {'content': content_tensor, 'style_label': style_OHE}
-                transform_output = generator(input_dict)
+                style_dict = {'style': style_tensor, 'style_label': style_OHE}
+
+                transform_output, _, _ = generator(content_tensor, style_dict)
 
                 generate_img = transform_output.squeeze(0).cpu().data.numpy()
                 generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
@@ -100,10 +122,18 @@ if __name__ == '__main__':
                       help="The style root folder of training set.")
     conf.add_argument("--out_dir", type=str, default='transfer_images',
                       help=" The folder to save models.")
-    conf.add_argument('--ngf', type=int, default=32,
-                      help='The number of filter for generator.')
-    conf.add_argument('--ndf', type=int, default=32,
+    conf.add_argument('--conv_dim', type=int, default=64,
+                      help='The number of filter for encoder.')
+    conf.add_argument('--content_dim', type=int, default=256,
                       help='The number of filter for discriminator.')
+    conf.add_argument('--mlp_dim', type=int, default=256,
+                      help='The number of layer for mlp_CT.')
+    conf.add_argument('--bias_dim', type=int, default=256,
+                      help='The number of layer for mlp_mu.')
+    conf.add_argument('--res_blocks_num', type=int, default=8,
+                      help='The number of residual block for generator.')
+    conf.add_argument('--n_group', type=int, default=8,
+                      help='The number of group for generator.')
     conf.add_argument('--img_scale', type=int, default=1)
     conf.add_argument('--n_styles', type=int, default=4,
                       help='The number of styles.')

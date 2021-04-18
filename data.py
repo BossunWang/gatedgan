@@ -34,8 +34,6 @@ class ImageDataset(Dataset):
             temp = [(label, x) for x in sorted(glob.glob(style_sources[label] + "/*"))]
             self.Y.extend(temp)
 
-        print(len(self.X))
-
     def __getitem__(self, index):
         output = {'content': self.transform(Image.open(self.X[index % len(self.X)]).convert('RGB'))}
 

@@ -23,6 +23,8 @@ import shutil
 import argparse
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from scipy.linalg import block_diag
+import numpy as np
 
 from data import *
 from models import *
@@ -36,6 +38,39 @@ def get_lr(optimizer):
         return param_group['lr']
 
 
+def get_block_diagonal_mask(n_group, n_member):
+    G = n_group
+    ones = np.ones((n_member, n_member)).tolist()
+    mask = block_diag(ones, ones)
+    for i in range(G - 2):
+        mask = block_diag(mask, ones)
+    return torch.from_numpy(mask).float()
+
+
+def l1_criterion(input, target):
+    return torch.mean(torch.abs(input - target))
+
+
+def reg(x_arr, device):
+    # whitening_reg: G,C//G,C//G
+    I = torch.eye(x_arr[0][0].size(1)).unsqueeze(0).to(device)  # 1,C//G,C//G
+    loss = torch.FloatTensor([0]).to(device)
+    for x in x_arr:
+        x = torch.cat(x, dim=0)  # G*(# of style),C//G,C//G
+        loss = loss + torch.mean(torch.abs(x - I))
+    return loss / len(x_arr)
+
+
+def clamping_alpha(G):
+    for bottleneck in G.transformer.transformers[:-1]:
+        for gdwct in bottleneck.gdwct_modules:
+            gdwct.alpha.data.clamp_(0, 1)
+
+
+def l1_criterion(input, target):
+    return torch.mean(torch.abs(input - target))
+
+
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -44,11 +79,15 @@ def train(args):
     dataloader = DataLoader(train_dataset,
                             batch_size=args.batch_size, shuffle=True, num_workers=4)
 
+    # The number of blocks in the coloring matrix: G, The number of elements for each block: n_members^2
+    n_mem = args.content_dim // args.n_group
+    # This is used in generators to make the coloring matrix the block diagonal form.
+    mask = get_block_diagonal_mask(args.n_group, n_mem).to(device)
     # models
-    in_nc = 3
-    out_nc = 3
-    generator = Generator(in_nc, out_nc, args.n_styles, args.ngf)
-    discriminator = Discriminator(in_nc, args.n_styles, args.ndf)
+    generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
+                          , args.mlp_dim, args.bias_dim, args.content_dim, device)
+
+    discriminator = Discriminator()
 
     # Optimizers
     optimizer_G = torch.optim.Adam(generator.parameters(),
@@ -57,32 +96,23 @@ def train(args):
                                    lr=args.lr, betas=(0.5, 0.999))
 
     # init losses
-    if args.use_lsgan:
-        criterion_GAN = nn.MSELoss()
-    else:
-        criterion_GAN = nn.BCELoss()
-
-    criterion_ACGAN = nn.CrossEntropyLoss().to(device)
-    criterion_Rec = nn.L1Loss().to(device)
     criterion_TV = TVLoss(TVLoss_weight=args.tv_strength).to(device)
 
     ori_epoch = 0
     if args.resume:
-        checkpoint = torch.load(conf.pretrain_model, map_location=conf.device)
+        checkpoint = torch.load(args.pretrain_model, map_location=device)
         assert "epoch" in checkpoint \
                and "generator" in checkpoint \
-               and "discriminator" in checkpoint \
-               and "optimizerG" in checkpoint \
-               and "optimizerD" in checkpoint
+               and "" in checkpoint \
+               and "optimizerGA" in checkpoint \
+               and "optimizerGB" in checkpoint \
+               and "optimizerDA" in checkpoint \
+               and "optimizerDB" in checkpoint
         ori_epoch = checkpoint['epoch'] + 1
         generator.load_state_dict(checkpoint['generator'])
         discriminator.load_state_dict(checkpoint['discriminator'])
         optimizer_G.load_state_dict(checkpoint['optimizer_G'])
         optimizer_D.load_state_dict(checkpoint['optimizer_D'])
-
-    # set DataParallel for models
-    generator = torch.nn.DataParallel(generator).to(device)
-    discriminator = torch.nn.DataParallel(discriminator).to(device)
 
     # LR schedulers
     lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(optimizer_G,
@@ -94,41 +124,31 @@ def train(args):
                                                                           , ori_epoch
                                                                           , args.decay_epoch).step)
 
-    # init Weights
-    generator.apply(weights_init_normal)
-    discriminator.apply(weights_init_normal)
+    generator.apply(weights_init('kaiming'))
+    discriminator.apply(weights_init('gaussian'))
 
-    # Set vars for training
-    batch = next(iter(dataloader))
-
-    input_A = torch.zeros((args.batch_size, in_nc, args.fineSize, args.fineSize)).to(device)
-    input_B = torch.zeros((args.batch_size, out_nc, args.fineSize, args.fineSize)).to(device)
-    target_real = Variable(torch.tensor(args.batch_size).fill_(1.0), requires_grad=False).to(device)
-    target_fake = Variable(torch.tensor(args.batch_size).fill_(0.0), requires_grad=False).to(device)
-
-    D_A_size = discriminator(input_A.copy_(batch['style']))[0].size()
-    D_AC_size = discriminator(input_B.copy_(batch['style']))[1].size()
-
-    print('D_A_size:', D_A_size)
-    print('D_AC_size:', D_AC_size)
-
-    class_label_B = torch.zeros(D_AC_size[0], D_AC_size[1], D_AC_size[2]).long().to(device)
+    # set DataParallel for models
+    generator = torch.nn.DataParallel(generator).to(device)
+    discriminator = torch.nn.DataParallel(discriminator).to(device)
 
     autoflag_OHE = torch.zeros(1, args.n_styles + 1).long().to(device)
     # assigned last one to content label
     autoflag_OHE[0][-1] = 1
 
-    fake_label = torch.zeros(D_A_size).fill_(0.0).to(device)
-    real_label = torch.zeros(D_A_size).fill_(0.99).to(device)
+    # fake_label = torch.zeros(D_A_size).fill_(0.0).to(device)
+    # real_label = torch.zeros(D_A_size).fill_(0.99).to(device)
     fake_buffer = ReplayBuffer()
 
+    generator.train()
+    discriminator.train()
+
     generator_loss_meter = AverageMeter()
-    reconstruction_loss_meter = AverageMeter()
     loss_g_gan_meter = AverageMeter()
-    loss_g_ac_meter = AverageMeter()
-    discriminator_gan_loss_meter = AverageMeter()
+    reconstruction_loss_meter = AverageMeter()
     tv_loss_meter = AverageMeter()
-    discriminator_class_loss_meter = AverageMeter()
+    loss_whitening_reg_meter = AverageMeter()
+    loss_coloring_reg_meter = AverageMeter()
+    discriminator_gan_loss_meter = AverageMeter()
 
     # TRAIN LOOP
     for epoch in range(ori_epoch, args.epochs):
@@ -144,107 +164,81 @@ def train(args):
             style_label = batch['style_label'].to(device)
             # one-hot encoded style
             style_OHE = F.one_hot(style_label, args.n_styles).long().to(device)
-            # style Label mapped over 1x19x19 tensor for patch discriminator
-            class_label = class_label_B.copy_(label2tensor(style_label, class_label_B)).long().to(device)
+            style_dict = {'style': real_style, 'style_label': style_OHE}
+            identity_dict = {'style': real_content, 'style_label': autoflag_OHE}
+
+            # Generate style-transferred image
+            genfake, whitening_reg, coloring_reg = generator(real_content, style_dict)
+            # Add generated image to image pool and randomly sample pool
+            # fake = fake_buffer.push_and_pop(genfake)
+
+            # Auto encoder
+            identity, _, _ = generator(real_content, identity_dict)
 
             # Update Discriminator
             optimizer_D.zero_grad()
 
-            # Generate style-transfered image
-            genfake = generator({
-                'content': real_content,
-                'style_label': style_OHE})
+            # D loss
+            errD = discriminator.module.calc_dis_loss(genfake.detach(), real_style)
 
-            # Add generated image to image pool and randomly sample pool
-            fake = fake_buffer.push_and_pop(genfake)
-            # Discriminator forward pass with sampled fake
-            out_gan, out_class = discriminator(fake)
-
-            # Discriminator Fake loss (correctly identify generated images)
-            errD_fake = criterion_GAN(out_gan, fake_label)
-            # Backward pass and parameter optimization
-            errD_fake.backward()
+            errD.backward()
             optimizer_D.step()
 
-            optimizer_D.zero_grad()
-            # Discriminator forward pass with target style
-            out_gan, out_class = discriminator(real_style)
-            # Discriminator Style Classification loss
-            errD_real_class = criterion_ACGAN(out_class.transpose(1, 3), class_label) * args.lambda_A
-            # Discriminator Real loss (correctly identify real style images)
-            errD_real = criterion_GAN(out_gan, real_label)
-            errD_real_total = errD_real + errD_real_class
-            # Backward pass and parameter optimization
-            errD_real_total.backward()
-            optimizer_D.step()
-
-            errD = (errD_real + errD_fake) / 2.0
-
-            # Generator Update
-            # Style Transfer Loss
+            # Update Generator
+            clamping_alpha(generator.module)
             optimizer_G.zero_grad()
 
-            # Discriminator forward pass with generated style transfer
-            out_gan, out_class = discriminator(genfake)
-
-            # Generator gan (real/fake) loss
-            err_gan = criterion_GAN(out_gan, real_label)
-            # Generator style class loss
-            err_class = criterion_ACGAN(out_class.transpose(1, 3), class_label) * args.lambda_A
+            # G losses
+            err_gan = discriminator.module.calc_gen_loss(genfake)
+            # Auto-Encoder (Recreation) Loss
+            err_ae = args.autoencoder_constrain * l1_criterion(identity, real_content)
             # Total Variation loss
             err_TV = criterion_TV(genfake)
 
-            errG_tot = err_gan + err_class + err_TV
+            loss_whitening_reg = args.lambda_w * reg([whitening_reg], device)
+            loss_coloring_reg = args.lambda_c * reg([coloring_reg], device)
+
+            errG_tot = err_gan + err_ae + err_TV + loss_whitening_reg + loss_coloring_reg
 
             errG_tot.backward()
             optimizer_G.step()
 
-            # Auto-Encoder (Recreation) Loss
-            optimizer_G.zero_grad()
-            identity = generator({
-                'content': real_content,
-                'style_label': autoflag_OHE,
-            })
-            err_ae = criterion_Rec(identity, real_content) * args.autoencoder_constrain
-            err_ae.backward()
-            optimizer_G.step()
-
             generator_loss_meter.update(errG_tot.item(), args.batch_size)
-            reconstruction_loss_meter.update(err_ae.item(), args.batch_size)
             loss_g_gan_meter.update(err_gan.item(), args.batch_size)
-            loss_g_ac_meter.update(err_class.item(), args.batch_size)
-            discriminator_gan_loss_meter.update(errD.item(), args.batch_size)
+            reconstruction_loss_meter.update(err_ae.item(), args.batch_size)
             tv_loss_meter.update(err_TV.item(), args.batch_size)
-            discriminator_class_loss_meter.update(errD_real_class.item(), args.batch_size)
+            loss_whitening_reg_meter.update(loss_whitening_reg.item(), args.batch_size)
+            loss_coloring_reg_meter.update(loss_coloring_reg.item(), args.batch_size)
+            discriminator_gan_loss_meter.update(errD.item(), args.batch_size)
 
             if batch_idx % args.print_freq == 0:
                 generator_loss_val = generator_loss_meter.avg
-                reconstruction_loss_val = reconstruction_loss_meter.avg
                 loss_g_gan_val = loss_g_gan_meter.avg
-                loss_g_ac_val = loss_g_ac_meter.avg
-                discriminator_gan_loss_val = discriminator_gan_loss_meter.avg
+                reconstruction_loss_val = reconstruction_loss_meter.avg
                 tv_loss_val = tv_loss_meter.avg
-                discriminator_class_loss_val = discriminator_class_loss_meter.avg
+                loss_whitening_reg_val = loss_whitening_reg_meter.avg
+                loss_coloring_reg_val = loss_coloring_reg_meter.avg
+                discriminator_gan_loss_val = discriminator_gan_loss_meter.avg
 
                 lr_G = get_lr(optimizer_G)
                 lr_D = get_lr(optimizer_D)
 
                 print('Epoch %d, iter %d / %d, lr G %f, lr D %f'
                       ', Generator Loss %f'
-                      ', Reconstruction Loss %f'
                       ', loss_G_GAN %f'
-                      ', loss_G_AC %f'
-                      ', Discriminator GAN Loss %f'
+                      ', Reconstruction Loss %f'
                       ', tv_loss %f'
-                      ', Discriminator Class Loss %f' %
+                      ', whitening_reg %f'
+                      ', coloring_reg %f'
+                      ', Discriminator GAN Loss %f' %
                       (epoch, batch_idx, len(dataloader), lr_G, lr_D
                        , generator_loss_val
-                       , reconstruction_loss_val
                        , loss_g_gan_val
-                       , loss_g_ac_val
-                       , discriminator_gan_loss_val
+                       , reconstruction_loss_val
                        , tv_loss_val
-                       , discriminator_class_loss_val))
+                       , loss_whitening_reg_val
+                       , loss_coloring_reg_val
+                       , discriminator_gan_loss_val))
 
                 plt.imsave(os.path.join(args.log_dir, 'images', 'content_%d.png' % epoch)
                            , (real_content[0].detach().cpu().numpy().transpose(1, 2, 0) + 1) / 2)
@@ -259,20 +253,20 @@ def train(args):
                 args.writer.add_scalar('lr_G', lr_G, global_batch_idx)
                 args.writer.add_scalar('lr_D', lr_G, global_batch_idx)
                 args.writer.add_scalar('Generator Loss', generator_loss_val, global_batch_idx)
-                args.writer.add_scalar('Reconstruction Loss', reconstruction_loss_val, global_batch_idx)
                 args.writer.add_scalar('loss_G_GAN', loss_g_gan_val, global_batch_idx)
-                args.writer.add_scalar('loss_G_AC', loss_g_ac_val, global_batch_idx)
-                args.writer.add_scalar('Discriminator GAN Loss', discriminator_gan_loss_val, global_batch_idx)
+                args.writer.add_scalar('Reconstruction Loss', reconstruction_loss_val, global_batch_idx)
                 args.writer.add_scalar('tv_loss', tv_loss_val, global_batch_idx)
-                args.writer.add_scalar('Discriminator Class Loss', discriminator_class_loss_val, global_batch_idx)
+                args.writer.add_scalar('loss_whitening_reg', loss_whitening_reg_val, global_batch_idx)
+                args.writer.add_scalar('loss_coloring_reg', loss_coloring_reg_val, global_batch_idx)
+                args.writer.add_scalar('Discriminator GAN Loss', discriminator_gan_loss_val, global_batch_idx)
 
                 generator_loss_meter.reset()
-                reconstruction_loss_meter.reset()
                 loss_g_gan_meter.reset()
-                loss_g_ac_meter.reset()
-                discriminator_gan_loss_meter.reset()
+                reconstruction_loss_meter.reset()
                 tv_loss_meter.reset()
-                discriminator_class_loss_meter.reset()
+                loss_whitening_reg_meter.reset()
+                loss_coloring_reg_meter.reset()
+                discriminator_gan_loss_meter.reset()
 
         # update learning rates
         lr_scheduler_G.step()
@@ -313,20 +307,28 @@ if __name__ == '__main__':
                       help='The load image size.')
     conf.add_argument('--fineSize', type=int, default=128,
                       help='The cropped image size.')
-    conf.add_argument('--ngf', type=int, default=32,
-                      help='The number of filter for generator.')
-    conf.add_argument('--ndf', type=int, default=32,
+    conf.add_argument('--conv_dim', type=int, default=64,
+                      help='The number of filter for encoder.')
+    conf.add_argument('--content_dim', type=int, default=256,
                       help='The number of filter for discriminator.')
+    conf.add_argument('--mlp_dim', type=int, default=256,
+                      help='The number of layer for mlp_CT.')
+    conf.add_argument('--bias_dim', type=int, default=256,
+                      help='The number of layer for mlp_mu.')
+    conf.add_argument('--res_blocks_num', type=int, default=8,
+                      help='The number of residual block for generator.')
+    conf.add_argument('--n_group', type=int, default=8,
+                      help='The number of group for generator.')
     conf.add_argument('--n_styles', type=int, default=4,
                       help='The number of styles.')
-    conf.add_argument('--use_lsgan', type=bool, default=True,
-                      help='whether to use lsgan loss.')
-    conf.add_argument('--lambda_A', type=float, default=1.,
-                      help='The weight for discriminator style classification loss.')
     conf.add_argument('--autoencoder_constrain', type=float, default=10.,
                       help='The weight for reconstruct loss.')
     conf.add_argument('--tv_strength', type=float, default=1e-6,
                       help='The weight for tv loss.')
+    conf.add_argument('--lambda_w', type=float, default=1e-3,
+                      help='The weight for whitening regularization.')
+    conf.add_argument('--lambda_c', type=float, default=10.,
+                      help='The weight for coloring regularization.')
     conf.add_argument('--print_freq', type=int, default=10,
                       help='The print frequency for training state.')
     conf.add_argument('--save_freq', type=int, default=1,
@@ -343,14 +345,16 @@ if __name__ == '__main__':
                       help='Resume from checkpoint or not.')
     conf.add_argument("--pretrain_model", type=str, default='',
                       help="where the checkpoint saved")
+    conf.add_argument("--vgg_model", type=str, default='',
+                      help="where the vgg encoder saved")
 
     args = conf.parse_args()
 
     if not os.path.exists(args.out_dir):
         os.makedirs(args.out_dir)
-    if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
+    if not os.path.exists(os.path.join(args.log_dir, 'images')):
         os.makedirs(os.path.join(args.log_dir, 'images'))
+
     tensorboardx_logdir = os.path.join(args.log_dir, args.tensorboardx_logdir)
     if os.path.exists(tensorboardx_logdir):
         shutil.rmtree(tensorboardx_logdir)
