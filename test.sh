@@ -6,6 +6,6 @@
 
 CUDA_VISIBLE_DEVICES=1 python test.py \
 --content_dir '../../custom_pictures' \
---style_dir '../../photo2fourcollection/style' \
---img_scale 6 \
---model_path 'saved_models/GatedGAN_Epoch_40.pt'
+--style_dir '../../photo2fourcollection/style/train' \
+--img_scale 4 \
+--model_path 'saved_models/GatedGAN_Epoch_10.pt'

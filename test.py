@@ -14,9 +14,12 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 from scipy.linalg import block_diag
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 
 from models import *
 from utils import *
+from data import *
 
 
 def get_block_diagonal_mask(n_group, n_member):
@@ -29,7 +32,6 @@ def get_block_diagonal_mask(n_group, n_member):
 
 
 def toTensor(img, mean, std):
-
     image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     image = image.astype(np.float32)
     image /= 255.0
@@ -50,18 +52,55 @@ def test(args):
     # models
     generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
                           , args.mlp_dim, args.bias_dim, args.content_dim, device).to(device)
+    # generator = torch.nn.DataParallel(generator).to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
-    assert "generator" in checkpoint
-    generator.load_state_dict(checkpoint['generator'])
+
+    assert "generatorB" in checkpoint
+    generator.load_state_dict(checkpoint['generatorB'])
 
     generator.eval()
 
     mean_array = np.array([0.5, 0.5, 0.5]).reshape(1, 1, 3)
     std_array = np.array([0.5, 0.5, 0.5]).reshape(1, 1, 3)
 
+    #
+    # train_dataset = ImageDataset(args.content_dir, args.style_dir, mode='train')
+    # dataloader = DataLoader(train_dataset,
+    #                         batch_size=1, shuffle=False, num_workers=4)
+    #
+
+    # for batch_idx, batch in tqdm(enumerate(dataloader)):
+    #     # Unpack minibatch
+    #     # source content
+    #     real_content = batch['content'].to(device)
+    #     # target style
+    #     real_style = batch['style'].to(device)
+    #     # style label
+    #     style_label = batch['style_label'].to(device)
+    #     # one-hot encoded style
+    #     style_OHE = F.one_hot(style_label, args.n_styles).long().to(device)
+    #     style_dict = {'style': real_style, 'style_label': style_OHE}
+    #
+    #     clamping_alpha(generator)
+    #
+    #     with torch.no_grad():
+    #         transform_output, _, _, _, _ = generator(real_content, style_dict)
+    #
+    #     plt.imshow((transform_output[0].detach().cpu().numpy().transpose(1, 2, 0) + 1) / 2)
+    #     plt.show()
+    #
+    #     # generate_img = transform_output.squeeze(0).cpu().data.numpy()
+    #     # generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
+    #     # generate_img = 255 * generate_img
+    #     # generate_img = generate_img.astype(np.uint8)
+    #     # generate_img = cv2.cvtColor(generate_img, cv2.COLOR_BGR2RGB)
+    #     #
+    #     # cv2.imshow("test", generate_img)
+    #     # cv2.waitKey(0)
+
     # create label dir
-    style_sources = sorted(glob.glob(os.path.join(args.style_dir, 'train', '*')))
+    style_sources = sorted(glob.glob(os.path.join(args.style_dir, '*')))
 
     style_labels = []
     for style_label in style_sources:
@@ -72,6 +111,8 @@ def test(args):
 
     assert len(style_labels) == args.n_styles
 
+    print(style_labels)
+
     for file_path, dirs, file_names in os.walk(args.content_dir):
         for file_name in tqdm(sorted(file_names)):
             org_p = os.path.join(file_path, file_name)
@@ -79,28 +120,40 @@ def test(args):
             if org_image is None:
                 continue
 
-            w = int(org_image.shape[0] / args.img_scale)
-            h = int(org_image.shape[1] / args.img_scale)
+            # w = org_image.shape[0]
+            # h = org_image.shape[1]
+
+            # offest = h if w > h else w
+
+            # crop_img = org_image[0:offest, 0:offest]
+
+            w = int(org_image.shape[1] / args.img_scale)
+            h = int(org_image.shape[0] / args.img_scale)
 
             w = (w // 100) * 100
             h = (h // 100) * 100
             # print(w, h)
 
-            content_img = cv2.resize(org_image, (h, w), interpolation=cv2.INTER_CUBIC)
+            # content_img = cv2.resize(crop_img, (400, 400), interpolation=cv2.INTER_CUBIC)
+            content_img = cv2.resize(org_image, (w, h), interpolation=cv2.INTER_CUBIC)
             content_tensor = toTensor(content_img, mean_array, std_array).to(device)
 
             for style_index in range(args.n_styles):
-                style_path = os.path.join(args.style_dir, 'train', style_labels[style_index].split('/')[-1])
+                style_path = os.path.join(args.style_dir, style_labels[style_index].split('/')[-1])
                 style_files = os.listdir(style_path)
 
                 style_image = cv2.imread(os.path.join(style_path, style_files[0]))
+                style_image = cv2.resize(style_image, (400, 400), interpolation=cv2.INTER_CUBIC)
+
                 style_tensor = toTensor(style_image, mean_array, std_array).to(device)
                 style_index = torch.tensor(style_index)
 
                 style_OHE = F.one_hot(style_index, args.n_styles).unsqueeze(0).long().to(device)
+
                 style_dict = {'style': style_tensor, 'style_label': style_OHE}
 
-                transform_output, _, _ = generator(content_tensor, style_dict)
+                with torch.no_grad():
+                    transform_output, _, _, _, _ = generator(content_tensor, style_dict)
 
                 generate_img = transform_output.squeeze(0).cpu().data.numpy()
                 generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)

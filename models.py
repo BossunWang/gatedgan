@@ -205,7 +205,7 @@ class WCT(nn.Module):
         super(WCT, self).__init__()
         self.G = n_group
         self.device = device
-        self.alpha = nn.Parameter(torch.ones(1) - w_alpha)
+        self.alpha = w_alpha
         self.mlp_CT = MLP(input_dim // n_group, (input_dim // n_group) ** 2, dim=mlp_dim, num_block=3, norm='none',
                           n_group=n_group, activation='lrelu')
         self.mlp_mu = MLP(input_dim, bias_dim, dim=input_dim, num_block=1, norm='none', n_group=n_group,
@@ -331,23 +331,19 @@ class Style_Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, n_styles, input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4, device=None, auto_id=True):
+    def __init__(self, n_styles, input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4, device=None):
         super(Transformer, self).__init__()
         self.transformers = nn.ModuleList(
             [Bottleneck(input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num // 2, device=device)
              for i in range(n_styles)])
         self.n_styles = n_styles
-        if auto_id:
-            self.transformers.append(Identity())
 
     def forward(self, c_A, s_B, style_label):
         whitening_reg = None
         coloring_reg = None
 
         for (i, v) in enumerate(style_label[0]):
-            if v and i == self.n_styles:
-                transformed = self.transformers[i](c_A)
-            elif v:
+            if v:
                 transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
 
         # return content transformed by style specific residual block
@@ -390,7 +386,7 @@ class Generator(nn.Module):
         style_feature, style_onehot_label = self.s_encoder(style_dict)
         c_A, whitening_reg, coloring_reg = self.transformer(content_feature, style_feature, style_onehot_label)
         output = self.decoder(c_A)
-        return output, whitening_reg, coloring_reg
+        return output, whitening_reg, coloring_reg, content_feature, style_feature
 
 
 class Discriminator(nn.Module):
@@ -479,7 +475,7 @@ if __name__ == '__main__':
 
     content = torch.rand((1, 3, 128, 128)).to(device)
     style = torch.rand((1, 3, 128, 128)).to(device)
-    label = torch.tensor([1, 0, 0, 0, 0]).unsqueeze(0).to(device)
+    label = torch.tensor([1, 0, 0, 0]).unsqueeze(0).to(device)
     style_dict = {'style': style, 'style_label': label}
     # The number of blocks in the coloring matrix: G, The number of elements for each block: n_members^2
     n_mem = content_dim // n_group
@@ -505,7 +501,7 @@ if __name__ == '__main__':
     print("decoder output:", output.size())
 
     generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
-    output, _, _ = generator(content, style_dict)
+    output, _, _, _, _ = generator(content, style_dict)
     print("generator output:", output.size())
 
     discriminator = Discriminator().to(device)

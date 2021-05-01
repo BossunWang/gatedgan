@@ -10,8 +10,8 @@ from PIL import Image
 
 class ImageDataset(Dataset):
     def __init__(self, content_dir, style_dir, transforms_=None, mode='train'):
-        transforms_ = [transforms.Resize(int(143), Image.BICUBIC),
-                       transforms.RandomCrop(128),
+        transforms_ = [transforms.Resize(300, Image.BICUBIC),
+                       transforms.RandomCrop(256),
                        transforms.RandomHorizontalFlip(),
                        transforms.ToTensor(),
                        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
