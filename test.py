@@ -64,41 +64,6 @@ def test(args):
     mean_array = np.array([0.5, 0.5, 0.5]).reshape(1, 1, 3)
     std_array = np.array([0.5, 0.5, 0.5]).reshape(1, 1, 3)
 
-    #
-    # train_dataset = ImageDataset(args.content_dir, args.style_dir, mode='train')
-    # dataloader = DataLoader(train_dataset,
-    #                         batch_size=1, shuffle=False, num_workers=4)
-    #
-
-    # for batch_idx, batch in tqdm(enumerate(dataloader)):
-    #     # Unpack minibatch
-    #     # source content
-    #     real_content = batch['content'].to(device)
-    #     # target style
-    #     real_style = batch['style'].to(device)
-    #     # style label
-    #     style_label = batch['style_label'].to(device)
-    #     # one-hot encoded style
-    #     style_OHE = F.one_hot(style_label, args.n_styles).long().to(device)
-    #     style_dict = {'style': real_style, 'style_label': style_OHE}
-    #
-    #     clamping_alpha(generator)
-    #
-    #     with torch.no_grad():
-    #         transform_output, _, _, _, _ = generator(real_content, style_dict)
-    #
-    #     plt.imshow((transform_output[0].detach().cpu().numpy().transpose(1, 2, 0) + 1) / 2)
-    #     plt.show()
-    #
-    #     # generate_img = transform_output.squeeze(0).cpu().data.numpy()
-    #     # generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
-    #     # generate_img = 255 * generate_img
-    #     # generate_img = generate_img.astype(np.uint8)
-    #     # generate_img = cv2.cvtColor(generate_img, cv2.COLOR_BGR2RGB)
-    #     #
-    #     # cv2.imshow("test", generate_img)
-    #     # cv2.waitKey(0)
-
     # create label dir
     style_sources = sorted(glob.glob(os.path.join(args.style_dir, '*')))
 
@@ -145,7 +110,7 @@ def test(args):
                 style_files = os.listdir(style_path)
 
                 style_image = cv2.imread(os.path.join(style_path, style_files[0]))
-                style_image = cv2.resize(style_image, (400, 400), interpolation=cv2.INTER_CUBIC)
+                style_image = cv2.resize(style_image, (256, 256), interpolation=cv2.INTER_CUBIC)
 
                 style_tensor = toTensor(style_image, mean_array, std_array).to(device)
                 style_index = torch.tensor(style_index)
@@ -167,13 +132,15 @@ def test(args):
 
                 style_dict_list.append(style_dict)
 
-            # mix style
+            # mix style exclude ukiyoe
             mix_count = 4
-            mix_raate = 1. / mix_count
+            mix_rate = 0.33
             content_tensor_list = []
             for i, style_dict in enumerate(style_dict_list):
                 content_tensor_list.append(content_tensor)
-                style_dict_list[i]['style_label'] *= mix_raate
+                style_dict_list[i]['style_label'] *= mix_rate
+
+            style_dict_list[2]['style_label'] *= 0.
 
             # mix first two style
             with torch.no_grad():
@@ -186,7 +153,7 @@ def test(args):
             generate_img = cv2.cvtColor(generate_img, cv2.COLOR_BGR2RGB)
 
             mixed_file_name = ''
-            for style_label in style_labels:
+            for style_label in style_labels[:mix_count]:
                 mixed_file_name += style_label + '_'
 
             mixed_file_name += file_name
