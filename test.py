@@ -51,7 +51,7 @@ def test(args):
 
     # models
     generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
-                          , args.mlp_dim, args.bias_dim, args.content_dim, device).to(device)
+                          , args.mlp_dim, args.bias_dim, args.content_dim, is_training=False, device=device).to(device)
     # generator = torch.nn.DataParallel(generator).to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
@@ -138,6 +138,8 @@ def test(args):
             content_img = cv2.resize(org_image, (w, h), interpolation=cv2.INTER_CUBIC)
             content_tensor = toTensor(content_img, mean_array, std_array).to(device)
 
+            style_dict_list = []
+
             for style_index in range(args.n_styles):
                 style_path = os.path.join(args.style_dir, style_labels[style_index].split('/')[-1])
                 style_files = os.listdir(style_path)
@@ -148,12 +150,11 @@ def test(args):
                 style_tensor = toTensor(style_image, mean_array, std_array).to(device)
                 style_index = torch.tensor(style_index)
 
-                style_OHE = F.one_hot(style_index, args.n_styles).unsqueeze(0).long().to(device)
-
+                style_OHE = F.one_hot(style_index, args.n_styles).unsqueeze(0).float().to(device)
                 style_dict = {'style': style_tensor, 'style_label': style_OHE}
 
                 with torch.no_grad():
-                    transform_output, _, _, _, _ = generator(content_tensor, style_dict)
+                    transform_output, _, _, _, _ = generator([content_tensor], [style_dict])
 
                 generate_img = transform_output.squeeze(0).cpu().data.numpy()
                 generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
@@ -163,6 +164,34 @@ def test(args):
 
                 output_name = os.path.join(args.out_dir, style_labels[style_index], file_name)
                 cv2.imwrite(output_name, generate_img)
+
+                style_dict_list.append(style_dict)
+
+            # mix style
+            mix_count = 4
+            mix_raate = 1. / mix_count
+            content_tensor_list = []
+            for i, style_dict in enumerate(style_dict_list):
+                content_tensor_list.append(content_tensor)
+                style_dict_list[i]['style_label'] *= mix_raate
+
+            # mix first two style
+            with torch.no_grad():
+                transform_output, _, _, _, _ = generator(content_tensor_list[:mix_count], style_dict_list[:mix_count])
+
+            generate_img = transform_output.squeeze(0).cpu().data.numpy()
+            generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
+            generate_img = 255 * generate_img
+            generate_img = generate_img.astype(np.uint8)
+            generate_img = cv2.cvtColor(generate_img, cv2.COLOR_BGR2RGB)
+
+            mixed_file_name = ''
+            for style_label in style_labels:
+                mixed_file_name += style_label + '_'
+
+            mixed_file_name += file_name
+            output_mixed_name = os.path.join(args.out_dir, mixed_file_name)
+            cv2.imwrite(output_mixed_name, generate_img)
 
 
 if __name__ == '__main__':

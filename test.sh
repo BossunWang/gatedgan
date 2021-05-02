@@ -8,4 +8,4 @@ CUDA_VISIBLE_DEVICES=1 python test.py \
 --content_dir '../../custom_pictures' \
 --style_dir '../../photo2fourcollection/style/train' \
 --img_scale 4 \
---model_path 'saved_models/GatedGAN_Epoch_10.pt'
+--model_path 'saved_models_20210501/GatedGAN_Epoch_10.pt'

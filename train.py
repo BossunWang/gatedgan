@@ -171,8 +171,8 @@ def train(args):
 
             # Update Discriminator
             # Generate style-transferred image
-            x_BA, _, _, _, _ = generatorA(real_style, identity_dict)
-            x_AB, _, _, _, _ = generatorB(real_content, style_dict)
+            x_BA, _, _, _, _ = generatorA([real_style], [identity_dict])
+            x_AB, _, _, _, _ = generatorB([real_content], [style_dict])
 
             # D loss
             d_loss_a = discriminatorA.module.calc_dis_loss(x_BA.detach(), real_content)
@@ -188,20 +188,20 @@ def train(args):
 
             # Generate style-transferred image
             # 1st stage
-            x_BA, whitening_reg_BA, coloring_reg_BA, c_B, s_A = generatorA(real_style, identity_dict)
-            x_AB, whitening_reg_AB, coloring_reg_AB, c_A, s_B = generatorB(real_content, style_dict)
+            x_BA, whitening_reg_BA, coloring_reg_BA, c_B, s_A = generatorA([real_style], [identity_dict])
+            x_AB, whitening_reg_AB, coloring_reg_AB, c_A, s_B = generatorB([real_content], [style_dict])
 
             # 2st stage
             style_dict2 = {'style': x_AB, 'style_label': style_OHE}
             identity_dict2 = {'style': x_BA, 'style_label': autoflag_OHE}
             # from AB to A
-            x_ABA, whitening_reg_ABA, coloring_reg_ABA, c_BA, s_BA = generatorA(x_BA, identity_dict2)
+            x_ABA, whitening_reg_ABA, coloring_reg_ABA, c_BA, s_BA = generatorA([x_BA], [identity_dict2])
             # from BA to B
-            x_BAB, whitening_reg_BAB, coloring_reg_BAB, c_AB, s_AB = generatorB(x_AB, style_dict2)
+            x_BAB, whitening_reg_BAB, coloring_reg_BAB, c_AB, s_AB = generatorB([x_AB], [style_dict2])
             # from A to A
-            x_AA, _, _, _, _ = generatorA(real_content, identity_dict)
+            x_AA, _, _, _, _ = generatorA([real_content], [identity_dict])
             # from B to B
-            x_BB, _, _, _, _ = generatorB(real_style, style_dict)
+            x_BB, _, _, _, _ = generatorB([real_style], [style_dict])
 
             # G losses
             g_loss_fake = discriminatorA.module.calc_gen_loss(x_BA) + discriminatorB.module.calc_gen_loss(x_AB)

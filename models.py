@@ -299,8 +299,8 @@ class Content_Encoder(nn.Module):
         self.main = nn.Sequential(*layers)
         self.curr_dim = curr_dim
 
-    def forward(self, x):
-        return self.main(x)
+    def forward(self, inputs):
+        return [self.main(input) for input in inputs]
 
 
 class Style_Encoder(nn.Module):
@@ -326,28 +326,46 @@ class Style_Encoder(nn.Module):
         self.main = nn.Sequential(*layers)
         self.curr_dim = curr_dim
 
-    def forward(self, x):
-        return [self.main(x['style']), x['style_label']]
+    def forward(self, inputs):
+        return [[self.main(input['style']), input['style_label']] for input in inputs]
 
 
 class Transformer(nn.Module):
-    def __init__(self, n_styles, input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4, device=None):
+    def __init__(self, n_styles
+                 , input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4
+                 , device=None, is_training=True):
         super(Transformer, self).__init__()
         self.transformers = nn.ModuleList(
             [Bottleneck(input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num // 2, device=device)
              for i in range(n_styles)])
         self.n_styles = n_styles
+        self.is_training = is_training
 
-    def forward(self, c_A, s_B, style_label):
+    def forward(self, c_A_list, s_B_list):
         whitening_reg = None
         coloring_reg = None
 
-        for (i, v) in enumerate(style_label[0]):
-            if v:
-                transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
+        if self.is_training:
+            # take first feature only when training
+            c_A = c_A_list[0]
+            s_B = s_B_list[0][0]
+            style_label = s_B_list[0][1]
+
+            for (i, v) in enumerate(style_label[0]):
+                if v:
+                    transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
+                    transformed_feature = transformed
+        else:
+            transformed_feature = torch.zeros_like(c_A_list[0])
+            for c_A, s_B_dict in zip(c_A_list, s_B_list):
+                s_B = s_B_dict[0]
+                style_label = s_B_dict[1]
+                for (i, v) in enumerate(style_label[0]):
+                    transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
+                    transformed_feature += (transformed * v)
 
         # return content transformed by style specific residual block
-        return transformed, whitening_reg, coloring_reg
+        return transformed_feature, whitening_reg, coloring_reg
 
 
 class Decoder(nn.Module):
@@ -372,21 +390,21 @@ class Decoder(nn.Module):
 
 class Generator(nn.Module):
     def __init__(self, n_styles=4, conv_dim=64, res_blocks_num=8, mask=None, n_group=16,
-                 mlp_dim=256, bias_dim=512, content_dim=256, device=None):
+                 mlp_dim=256, bias_dim=512, content_dim=256, device=None, is_training=True):
         super(Generator, self).__init__()
 
         self.c_encoder = Content_Encoder(conv_dim, res_blocks_num // 2, norm='in', activation='relu').to(device)
         self.s_encoder = Style_Encoder(conv_dim, n_group, norm='gn', activation='relu').to(device)
         self.transformer = Transformer(n_styles, content_dim, mask, n_group
-                                       , bias_dim, mlp_dim, res_blocks_num // 2, device=device).to(device)
+                                       , bias_dim, mlp_dim, res_blocks_num // 2, device=device, is_training=is_training).to(device)
         self.decoder = Decoder(content_dim, n_group, norm='ln').to(device)
 
-    def forward(self, content, style_dict):
-        content_feature = self.c_encoder(content)
-        style_feature, style_onehot_label = self.s_encoder(style_dict)
-        c_A, whitening_reg, coloring_reg = self.transformer(content_feature, style_feature, style_onehot_label)
+    def forward(self, content_list, style_dict_list):
+        content_features = self.c_encoder(content_list)
+        style_list = self.s_encoder(style_dict_list)
+        c_A, whitening_reg, coloring_reg = self.transformer(content_features, style_list)
         output = self.decoder(c_A)
-        return output, whitening_reg, coloring_reg, content_feature, style_feature
+        return output, whitening_reg, coloring_reg, content_features[0], style_list[0][0]
 
 
 class Discriminator(nn.Module):
@@ -486,25 +504,37 @@ if __name__ == '__main__':
     s_encoder = Style_Encoder(conv_dim, n_group, norm='gn', activation='relu').to(device)
     transformer = Transformer(n_styles, content_dim, mask, n_group
                               , bias_dim, mlp_dim, res_blocks_num // 2, device=device).to(device)
+    transformer_test = Transformer(n_styles, content_dim, mask, n_group
+                              , bias_dim, mlp_dim, res_blocks_num // 2, is_training=False, device=device).to(device)
     decoder = Decoder(content_dim, n_group, norm='ln').to(device)
 
-    content_feature = c_encoder(content)
-    style_feature, style_onehot_label = s_encoder(style_dict)
+    content_features = c_encoder([content])
+    style_list = s_encoder([style_dict])
 
-    print("content_feature:", content_feature.size())
-    print("style_feature:", style_feature.size())
+    print("content_feature:", content_features[0].size())
+    print("style_feature:", style_list[0][0].size())
+    print("style_label:", style_list[0][1].size())
 
-    c_A, whitening_reg, coloring_reg = transformer(content_feature, style_feature, style_onehot_label)
+    c_A, whitening_reg, coloring_reg = transformer(content_features, style_list)
     print('c_A:', c_A.size())
+
+    content_features = c_encoder([content, content])
+    label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
+    label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
+    style_dict1 = {'style': style, 'style_label': label1}
+    style_dict2 = {'style': style, 'style_label': label2}
+    style_list = s_encoder([style_dict1, style_dict2])
+    c_A_test, _, _ = transformer_test(content_features, style_list)
+    print('c_A_test:', c_A_test.size())
 
     output = decoder(c_A)
     print("decoder output:", output.size())
 
     generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
-    output, _, _, _, _ = generator(content, style_dict)
+    output, _, _, _, _ = generator([content], [style_dict])
     print("generator output:", output.size())
 
-    discriminator = Discriminator().to(device)
-    output_list = discriminator(output)
-    for out in output_list:
-        print('discriminator out:', out.size())
+    # discriminator = Discriminator().to(device)
+    # output_list = discriminator(output)
+    # for out in output_list:
+    #     print('discriminator out:', out.size())
