@@ -2,17 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from torch_utils import *
 
 
 # https://github.com/chongyangma/cs231n/blob/master/assignments/assignment3/style_transfer_pytorch.py
 class TVLoss(nn.Module):
-    def __init__(self, TVLoss_weight= 1):
-        super(TVLoss,self).__init__()
+    def __init__(self, TVLoss_weight=1):
+        super(TVLoss, self).__init__()
         self.TVLoss_weight = TVLoss_weight
 
-    def forward(self,x):    
-        w_variance = torch.sum(torch.pow(x[:,:,:,:-1] - x[:,:,:,1:], 2))
-        h_variance = torch.sum(torch.pow(x[:,:,:-1,:] - x[:,:,1:,:], 2))
+    def forward(self, x):
+        w_variance = torch.sum(torch.pow(x[:, :, :, :-1] - x[:, :, :, 1:], 2))
+        h_variance = torch.sum(torch.pow(x[:, :, :-1, :] - x[:, :, 1:, :], 2))
         loss = self.TVLoss_weight * (h_variance + w_variance)
         return loss
 
@@ -28,10 +29,12 @@ class Identity(nn.Module):
 
 class ResidualBlock(nn.Module):
     """Residual Block with instance normalization."""
+
     def __init__(self, dim, norm='in', n_group=32, activation='relu', use_affine=True):
         super(ResidualBlock, self).__init__()
         layers = []
-        layers += [ConvBlock(dim, dim, 3, 1, 1, norm=norm, n_group=n_group, activation=activation, use_affine=use_affine)]
+        layers += [
+            ConvBlock(dim, dim, 3, 1, 1, norm=norm, n_group=n_group, activation=activation, use_affine=use_affine)]
         layers += [ConvBlock(dim, dim, 3, 1, 1, norm=norm, n_group=n_group, activation='none', use_affine=use_affine)]
         self.main = nn.Sequential(*layers)
 
@@ -41,7 +44,7 @@ class ResidualBlock(nn.Module):
 
 class ConvBlock(nn.Module):
     def __init__(self, input_dim, output_dim, k, s, p, dilation=False, norm='in', n_group=32,
-                        activation='relu', pad_type='mirror', use_affine=True, use_bias=True):
+                 activation='relu', pad_type='mirror', use_affine=True, use_bias=True):
         super(ConvBlock, self).__init__()
 
         # Init Normalization
@@ -200,6 +203,130 @@ class Get(object):
         return X, eigen_s
 
 
+class WCT_ZCAPIV2(nn.Module):
+    def __init__(self, num_features, mask, groups=1, eps=1e-2, momentum=0.1, w_alpha=0.4, training=True):
+        super(WCT_ZCAPIV2, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.groups = groups
+        self.alpha = w_alpha
+        self.mask = mask
+        self.training = training
+
+        self.svdlayer = svdv2.apply
+
+        self.register_buffer('running_content_mean', torch.zeros(num_features, 1))
+        self.register_buffer('running_style_mean', torch.zeros(num_features, 1))
+        self.create_dictionary()
+        self.reset_parameters()
+        self.dict = self.state_dict()
+
+    def create_dictionary(self):
+        length = int(self.num_features / self.groups)
+        for i in range(self.groups):
+            self.register_buffer("running_whitening{}".format(i), torch.eye(length, length))
+            self.register_buffer("running_coloring{}".format(i), torch.eye(length, length))
+
+    def reset_running_stats(self):
+        self.running_content_mean.zero_()
+        self.running_style_mean.zero_()
+
+    def reset_parameters(self):
+        self.reset_running_stats()
+
+    def _check_input_dim(self, input):
+        if input.dim() != 4:
+            raise ValueError('expected 4D input (got {}D input)'.format(input.dim()))
+
+    def group_feature_transform(self, x, running_mean=None):
+        if self.training:
+            N, C, H, W = x.size()
+            G = self.groups
+            x = x.transpose(0, 1).contiguous().view(C, -1)
+            mu = x.mean(1, keepdim=True)
+            x = x - mu
+            xxt = torch.mm(x, x.t()) / (N * H * W) + torch.eye(C, out=torch.empty_like(x)) * self.eps
+            assert C % G == 0
+            xxti = torch.chunk(xxt, G, dim=0)
+            xxtj = [torch.chunk(xxti[j], G, dim=1)[j] for j in range(G)]
+
+            xg = list(torch.chunk(x, G, dim=0))
+
+            return xg, xxtj, mu
+        else:
+            N, C, H, W = x.size()
+            x = x.transpose(0, 1).contiguous().view(C, -1)
+            x = (x - running_mean)
+            G = self.groups
+            xg = list(torch.chunk(x, G, dim=0))
+
+            return xg
+
+    def forward(self, c_A, s_B):
+        return self.wct(c_A, s_B)
+
+    def wct(self, c_A, s_B):
+        self._check_input_dim(c_A)
+        self._check_input_dim(s_B)
+
+        N, C, H, W = c_A.size()
+        colored_B_gr_list = []
+
+        if self.training:
+            c_A_g, c_A_c_At_j, c_A_mu = self.group_feature_transform(c_A)
+            s_B_g, s_B_s_Bt_j, s_B_mu = self.group_feature_transform(s_B)
+
+            for i in range(self.groups):
+                c_A_v, c_A_e = self.svdlayer(c_A_c_At_j[i])
+                s_B_v, s_B_e = self.svdlayer(s_B_s_Bt_j[i])
+
+                # whitening
+                whitening = torch.mm(c_A_v, torch.diag(c_A_e.pow(-0.5)).mm(c_A_v.t()))
+                c_A_whitening_gi = torch.mm(whitening, c_A_g[i])
+
+                # coloring
+                coloring = torch.mm(s_B_v, torch.diag(s_B_e.pow(0.5)).mm(s_B_v.t()))
+                colored_B_coloring_gi = torch.mm(coloring, c_A_whitening_gi)
+
+                colored_B_gr_list.append(colored_B_coloring_gi)
+
+                with torch.no_grad():
+                    running_whitening = self.__getattr__('running_whitening' + str(i))
+                    running_whitening.data = (1 - self.momentum) * running_whitening.data \
+                                             + self.momentum * whitening.data
+                    running_coloring = self.__getattr__('running_coloring' + str(i))
+                    running_coloring.data = (1 - self.momentum) * running_coloring.data \
+                                            + self.momentum * coloring.data
+
+            with torch.no_grad():
+                self.running_content_mean = (1 - self.momentum) * self.running_content_mean + self.momentum * c_A_mu
+                self.running_style_mean = (1 - self.momentum) * self.running_style_mean + self.momentum * s_B_mu
+
+            colored_B = torch.cat(colored_B_gr_list, dim=0)
+            styleize_B = colored_B + s_B_mu.expand_as(colored_B)
+            styleize_B = styleize_B.view(C, N, H, W).transpose(0, 1)
+        else:
+            c_A_g = self.group_feature_transform(c_A, self.running_content_mean)
+
+            for i in range(self.groups):
+                # whitening
+                whitening = self.__getattr__('running_whitening' + str(i))
+                c_A_whitening_gi = torch.mm(whitening, c_A_g[i])
+
+                # coloring
+                coloring = self.__getattr__('running_coloring' + str(i))
+                colored_B_coloring_gi = torch.mm(coloring, c_A_whitening_gi)
+
+                colored_B_gr_list.append(colored_B_coloring_gi)
+
+            colored_B = torch.cat(colored_B_gr_list, dim=0)
+            styleize_B = colored_B + self.running_style_mean.expand_as(colored_B)
+            styleize_B = styleize_B.view(C, N, H, W).transpose(0, 1)
+
+        return self.alpha * styleize_B + (1 - self.alpha) * c_A
+
+
 class WCT(nn.Module):
     def __init__(self, n_group, device, input_dim, mlp_dim, bias_dim, mask, w_alpha=0.4):
         super(WCT, self).__init__()
@@ -254,8 +381,10 @@ class Bottleneck(nn.Module):
         # Bottleneck layers
         self.resblocks = nn.ModuleList(
             [ResidualBlock(dim=curr_dim, norm='none', n_group=n_group) for i in range(repeat_num)])
-        self.gdwct_modules = nn.ModuleList(
-            [WCT(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
+        # self.gdwct_modules = nn.ModuleList(
+        #     [WCT(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
+        self.wct_ZCAPIv2_modules = nn.ModuleList(
+            [WCT_ZCAPIV2(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
 
     def forward(self, c_A, s_B):
         whitening_reg = []
@@ -264,12 +393,12 @@ class Bottleneck(nn.Module):
         # Multi-hops
         for i, resblock in enumerate(self.resblocks):
             if i == 0:
-                c_A, cov, eigen_s = self.gdwct_modules[i](c_A, s_B)
+                c_A, cov, eigen_s = self.wct_ZCAPIv2_modules[i](c_A, s_B)
                 whitening_reg += [cov]
                 coloring_reg += [eigen_s]
 
             c_A = resblock(c_A)
-            c_A, cov, eigen_s = self.gdwct_modules[i + 1](c_A, s_B)
+            c_A, cov, eigen_s = self.wct_ZCAPIv2_modules[i + 1](c_A, s_B)
             whitening_reg += [cov]
             coloring_reg += [eigen_s]
 
@@ -289,7 +418,7 @@ class Content_Encoder(nn.Module):
         curr_dim = conv_dim
         # H,W,64 => H/2,W/2,128 => H/4,W/4,256
         for i in range(2):
-            layers += [ConvBlock(curr_dim, curr_dim*2, 4, 2, 1, norm=norm, activation=activation)]
+            layers += [ConvBlock(curr_dim, curr_dim * 2, 4, 2, 1, norm=norm, activation=activation)]
             curr_dim = curr_dim * 2
 
         # Bottleneck layers
@@ -314,14 +443,14 @@ class Style_Encoder(nn.Module):
         curr_dim = conv_dim
         # H,W,64 => H/2,W/2,128 => H/4,W/4,256
         for i in range(2):
-            layers += [ConvBlock(curr_dim, curr_dim*2, 4, 2, 1, norm=norm, n_group=n_group, activation=activation)]
+            layers += [ConvBlock(curr_dim, curr_dim * 2, 4, 2, 1, norm=norm, n_group=n_group, activation=activation)]
             curr_dim = curr_dim * 2
 
         # Down-sampling layers (keep dim)
         # H/4,W/4,256, H/8,W/8,256, H/16,W/16,256
         for i in range(2):  # original: 2
             layers += [ConvBlock(curr_dim, curr_dim, 4, 2, 1, norm=norm, n_group=n_group, activation=activation)]
-        layers += [nn.AdaptiveAvgPool2d(1)] # H/16,W/16,256 => 1,1,256
+        layers += [nn.AdaptiveAvgPool2d(1)]  # H/16,W/16,256 => 1,1,256
 
         self.main = nn.Sequential(*layers)
         self.curr_dim = curr_dim
@@ -396,7 +525,8 @@ class Generator(nn.Module):
         self.c_encoder = Content_Encoder(conv_dim, res_blocks_num // 2, norm='in', activation='relu').to(device)
         self.s_encoder = Style_Encoder(conv_dim, n_group, norm='gn', activation='relu').to(device)
         self.transformer = Transformer(n_styles, content_dim, mask, n_group
-                                       , bias_dim, mlp_dim, res_blocks_num // 2, device=device, is_training=is_training).to(device)
+                                       , bias_dim, mlp_dim, res_blocks_num // 2, device=device,
+                                       is_training=is_training).to(device)
         self.decoder = Decoder(content_dim, n_group, norm='ln').to(device)
 
     def forward(self, content_list, style_dict_list):
@@ -453,7 +583,7 @@ class Discriminator(nn.Module):
 
         for it, (out0, out1) in enumerate(zip(outs0, outs1)):
             if self.gan_type == 'lsgan':
-                loss += torch.mean((out0 - 0)**2) + torch.mean((out1 - 1)**2)
+                loss += torch.mean((out0 - 0) ** 2) + torch.mean((out1 - 1) ** 2)
             else:
                 assert 0, "Unsupported GAN type: {}".format(self.gan_type)
         return loss
@@ -464,7 +594,7 @@ class Discriminator(nn.Module):
         loss = 0
         for it, (out0) in enumerate(outs0):
             if self.gan_type == 'lsgan':
-                loss += torch.mean((out0 - 1)**2)  # LSGAN
+                loss += torch.mean((out0 - 1) ** 2)  # LSGAN
             else:
                 assert 0, "Unsupported GAN type: {}".format(self.gan_type)
         return loss
@@ -474,13 +604,15 @@ if __name__ == '__main__':
     from scipy.linalg import block_diag
     import numpy as np
 
+
     def get_block_diagonal_mask(n_member):
         G = n_group
-        ones = np.ones((n_member,n_member)).tolist()
-        mask = block_diag(ones,ones)
-        for i in range(G-2):
-            mask = block_diag(mask,ones)
+        ones = np.ones((n_member, n_member)).tolist()
+        mask = block_diag(ones, ones)
+        for i in range(G - 2):
+            mask = block_diag(mask, ones)
         return torch.from_numpy(mask).float()
+
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     conv_dim = 64
@@ -505,7 +637,8 @@ if __name__ == '__main__':
     transformer = Transformer(n_styles, content_dim, mask, n_group
                               , bias_dim, mlp_dim, res_blocks_num // 2, device=device).to(device)
     transformer_test = Transformer(n_styles, content_dim, mask, n_group
-                              , bias_dim, mlp_dim, res_blocks_num // 2, is_training=False, device=device).to(device)
+                                   , bias_dim, mlp_dim, res_blocks_num // 2, is_training=False, device=device).to(
+        device)
     decoder = Decoder(content_dim, n_group, norm='ln').to(device)
 
     content_features = c_encoder([content])
@@ -515,24 +648,32 @@ if __name__ == '__main__':
     print("style_feature:", style_list[0][0].size())
     print("style_label:", style_list[0][1].size())
 
-    c_A, whitening_reg, coloring_reg = transformer(content_features, style_list)
-    print('c_A:', c_A.size())
+    wct_ZCAPIv2_model = WCT_ZCAPIV2(content_dim, mask, n_group).to(device)
+    wct_feature = wct_ZCAPIv2_model(content_features[0], style_list[0][0])
+    print('wct_feature:', wct_feature.size())
 
-    content_features = c_encoder([content, content])
-    label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
-    label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
-    style_dict1 = {'style': style, 'style_label': label1}
-    style_dict2 = {'style': style, 'style_label': label2}
-    style_list = s_encoder([style_dict1, style_dict2])
-    c_A_test, _, _ = transformer_test(content_features, style_list)
-    print('c_A_test:', c_A_test.size())
+    wct_ZCAPIv2_model_infer = WCT_ZCAPIV2(content_dim, mask, n_group, training=False).to(device)
+    wct_feature = wct_ZCAPIv2_model(content_features[0], style_list[0][0])
+    print('wct_feature inference:', wct_feature.size())
 
-    output = decoder(c_A)
-    print("decoder output:", output.size())
+    # c_A, whitening_reg, coloring_reg = transformer(content_features, style_list)
+    # print('c_A:', c_A.size())
+    #
+    # content_features = c_encoder([content, content])
+    # label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
+    # label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
+    # style_dict1 = {'style': style, 'style_label': label1}
+    # style_dict2 = {'style': style, 'style_label': label2}
+    # style_list = s_encoder([style_dict1, style_dict2])
+    # c_A_test, _, _ = transformer_test(content_features, style_list)
+    # print('c_A_test:', c_A_test.size())
 
-    generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
-    output, _, _, _, _ = generator([content], [style_dict])
-    print("generator output:", output.size())
+    # output = decoder(c_A)
+    # print("decoder output:", output.size())
+    #
+    # generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
+    # output, _, _, _, _ = generator([content], [style_dict])
+    # print("generator output:", output.size())
 
     # discriminator = Discriminator().to(device)
     # output_list = discriminator(output)
