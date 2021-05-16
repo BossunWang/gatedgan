@@ -51,7 +51,7 @@ def test(args):
 
     # models
     generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
-                          , args.mlp_dim, args.bias_dim, args.content_dim, is_training=False, device=device).to(device)
+                          , args.mlp_dim, args.bias_dim, args.content_dim, is_training=True, device=device).to(device)
     # generator = torch.nn.DataParallel(generator).to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
@@ -119,7 +119,7 @@ def test(args):
                 style_dict = {'style': style_tensor, 'style_label': style_OHE}
 
                 with torch.no_grad():
-                    transform_output, _, _, _, _ = generator([content_tensor], [style_dict])
+                    transform_output, _, _ = generator([content_tensor], [style_dict])
 
                 generate_img = transform_output.squeeze(0).cpu().data.numpy()
                 generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)
@@ -144,7 +144,7 @@ def test(args):
 
             # mix first two style
             with torch.no_grad():
-                transform_output, _, _, _, _ = generator(content_tensor_list[:mix_count], style_dict_list[:mix_count])
+                transform_output, _, _ = generator(content_tensor_list[:mix_count], style_dict_list[:mix_count])
 
             generate_img = transform_output.squeeze(0).cpu().data.numpy()
             generate_img = np.clip((generate_img.transpose(1, 2, 0) * std_array) + mean_array, 0., 1.)

@@ -148,8 +148,6 @@ def train(args):
     loss_cyc_meter = AverageMeter()
     loss_feature_s_meter = AverageMeter()
     loss_feature_c_meter = AverageMeter()
-    loss_whitening_reg_meter = AverageMeter()
-    loss_coloring_reg_meter = AverageMeter()
     discriminator_gan_loss_meter = AverageMeter()
 
     # TRAIN LOOP
@@ -171,8 +169,8 @@ def train(args):
 
             # Update Discriminator
             # Generate style-transferred image
-            x_BA, _, _, _, _ = generatorA([real_style], [identity_dict])
-            x_AB, _, _, _, _ = generatorB([real_content], [style_dict])
+            x_BA, _, _ = generatorA([real_style], [identity_dict])
+            x_AB, _, _ = generatorB([real_content], [style_dict])
 
             # D loss
             d_loss_a = discriminatorA.module.calc_dis_loss(x_BA.detach(), real_content)
@@ -185,23 +183,22 @@ def train(args):
             optimizer_D.step()
 
             # Update Generator
-
             # Generate style-transferred image
             # 1st stage
-            x_BA, whitening_reg_BA, coloring_reg_BA, c_B, s_A = generatorA([real_style], [identity_dict])
-            x_AB, whitening_reg_AB, coloring_reg_AB, c_A, s_B = generatorB([real_content], [style_dict])
+            x_BA, c_B, s_A = generatorA([real_style], [identity_dict])
+            x_AB, c_A, s_B = generatorB([real_content], [style_dict])
 
             # 2st stage
             style_dict2 = {'style': x_AB, 'style_label': style_OHE}
             identity_dict2 = {'style': x_BA, 'style_label': autoflag_OHE}
             # from AB to A
-            x_ABA, whitening_reg_ABA, coloring_reg_ABA, c_BA, s_BA = generatorA([x_BA], [identity_dict2])
+            x_ABA, c_BA, s_BA = generatorA([x_BA], [identity_dict2])
             # from BA to B
-            x_BAB, whitening_reg_BAB, coloring_reg_BAB, c_AB, s_AB = generatorB([x_AB], [style_dict2])
+            x_BAB, c_AB, s_AB = generatorB([x_AB], [style_dict2])
             # from A to A
-            x_AA, _, _, _, _ = generatorA([real_content], [identity_dict])
+            x_AA, _, _ = generatorA([real_content], [identity_dict])
             # from B to B
-            x_BB, _, _, _, _ = generatorB([real_style], [style_dict])
+            x_BB, _, _ = generatorB([real_style], [style_dict])
 
             # G losses
             g_loss_fake = discriminatorA.module.calc_gen_loss(x_BA) + discriminatorB.module.calc_gen_loss(x_AB)
@@ -210,16 +207,11 @@ def train(args):
             loss_cross_s = l1_criterion(s_AB, s_B) + l1_criterion(s_BA, s_A)
             loss_cross_c = l1_criterion(c_AB, c_A) + l1_criterion(c_BA, c_B)
 
-            loss_whitening_reg = reg([whitening_reg_AB, whitening_reg_BA, whitening_reg_ABA, whitening_reg_BAB], device)
-            loss_coloring_reg = reg([coloring_reg_AB, coloring_reg_BA, coloring_reg_ABA, coloring_reg_BAB], device)
-
             g_loss = g_loss_fake \
                      + args.lambda_x_rec * loss_ae_rec \
                      + args.lambda_x_cyc * loss_cross_rec \
                      + args.lambda_s * loss_cross_s \
-                     + args.lambda_c * loss_cross_c \
-                     + args.lambda_w_reg * loss_whitening_reg \
-                     + args.lambda_c_reg * loss_coloring_reg
+                     + args.lambda_c * loss_cross_c
 
             optimizer_G.zero_grad()
             g_loss.backward()
@@ -234,9 +226,6 @@ def train(args):
             loss_feature_s_meter.update(loss_cross_s.item(), args.batch_size)
             loss_feature_c_meter.update(loss_cross_c.item(), args.batch_size)
 
-            loss_whitening_reg_meter.update(loss_whitening_reg.item(), args.batch_size)
-            loss_coloring_reg_meter.update(loss_coloring_reg.item(), args.batch_size)
-
             discriminator_gan_loss_meter.update(d_loss.item(), args.batch_size)
 
             if batch_idx % args.print_freq == 0:
@@ -248,9 +237,6 @@ def train(args):
 
                 loss_feature_s_val = loss_feature_s_meter.avg
                 loss_feature_c_val = loss_feature_c_meter.avg
-
-                loss_whitening_reg_val = loss_whitening_reg_meter.avg
-                loss_coloring_reg_val = loss_coloring_reg_meter.avg
 
                 discriminator_gan_loss_val = discriminator_gan_loss_meter.avg
 
@@ -264,8 +250,6 @@ def train(args):
                       ', loss_cyc_val %f'
                       ', loss_feature_s_val %f'
                       ', loss_feature_c_val %f'
-                      ', whitening_reg %f'
-                      ', coloring_reg %f'
                       ', Discriminator GAN Loss %f' %
                       (epoch, batch_idx, len(dataloader), lr_G, lr_D
                        , generator_loss_val
@@ -274,8 +258,6 @@ def train(args):
                        , loss_cyc_val
                        , loss_feature_s_val
                        , loss_feature_c_val
-                       , loss_whitening_reg_val
-                       , loss_coloring_reg_val
                        , discriminator_gan_loss_val))
 
                 plt.imsave(os.path.join(args.log_dir, 'images', 'content_%d.png' % epoch)
@@ -296,8 +278,6 @@ def train(args):
                 args.writer.add_scalar('loss_cyc', loss_cyc_val, global_batch_idx)
                 args.writer.add_scalar('loss_feature_s', loss_feature_s_val, global_batch_idx)
                 args.writer.add_scalar('loss_feature_c', loss_feature_c_val, global_batch_idx)
-                args.writer.add_scalar('loss_whitening_reg', loss_whitening_reg_val, global_batch_idx)
-                args.writer.add_scalar('loss_coloring_reg', loss_coloring_reg_val, global_batch_idx)
                 args.writer.add_scalar('Discriminator GAN Loss', discriminator_gan_loss_val, global_batch_idx)
 
                 generator_loss_meter.reset()
@@ -306,8 +286,6 @@ def train(args):
                 loss_cyc_meter.reset()
                 loss_feature_s_meter.reset()
                 loss_feature_c_meter.reset()
-                loss_whitening_reg_meter.reset()
-                loss_coloring_reg_meter.reset()
                 discriminator_gan_loss_meter.reset()
 
         # update learning rates
@@ -373,10 +351,6 @@ if __name__ == '__main__':
                       help='The weight for content feature loss.')
     conf.add_argument('--lambda_c', type=float, default=1.,
                       help='The weight for style feature loss.')
-    conf.add_argument('--lambda_w_reg', type=float, default=1e-3,
-                      help='The weight for whitening regularization.')
-    conf.add_argument('--lambda_c_reg', type=float, default=10.,
-                      help='The weight for coloring regularization.')
     conf.add_argument('--tv_strength', type=float, default=1e-6,
                       help='The weight for tv loss.')
     conf.add_argument('--print_freq', type=int, default=10,

@@ -257,11 +257,12 @@ class WCT_ZCAPIV2(nn.Module):
         else:
             N, C, H, W = x.size()
             x = x.transpose(0, 1).contiguous().view(C, -1)
-            x = (x - running_mean)
+            mu = x.mean(1, keepdim=True)
+            x = (x - mu)
             G = self.groups
             xg = list(torch.chunk(x, G, dim=0))
 
-            return xg
+            return xg, mu
 
     def forward(self, c_A, s_B):
         return self.wct(c_A, s_B)
@@ -307,7 +308,8 @@ class WCT_ZCAPIV2(nn.Module):
             styleize_B = colored_B + s_B_mu.expand_as(colored_B)
             styleize_B = styleize_B.view(C, N, H, W).transpose(0, 1)
         else:
-            c_A_g = self.group_feature_transform(c_A, self.running_content_mean)
+            c_A_g, c_A_mu = self.group_feature_transform(c_A, self.running_content_mean)
+            s_B_g, s_B_mu = self.group_feature_transform(s_B, self.running_style_mean)
 
             for i in range(self.groups):
                 # whitening
@@ -321,10 +323,10 @@ class WCT_ZCAPIV2(nn.Module):
                 colored_B_gr_list.append(colored_B_coloring_gi)
 
             colored_B = torch.cat(colored_B_gr_list, dim=0)
-            styleize_B = colored_B + self.running_style_mean.expand_as(colored_B)
+            styleize_B = colored_B + s_B_mu.expand_as(colored_B)
             styleize_B = styleize_B.view(C, N, H, W).transpose(0, 1)
 
-        return self.alpha * styleize_B + (1 - self.alpha) * c_A
+        return styleize_B
 
 
 class WCT(nn.Module):
@@ -373,7 +375,7 @@ class WCT(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    def __init__(self, input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4, device=None):
+    def __init__(self, input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num=4, device=None, training=True):
         super(Bottleneck, self).__init__()
 
         curr_dim = input_dim
@@ -384,27 +386,18 @@ class Bottleneck(nn.Module):
         # self.gdwct_modules = nn.ModuleList(
         #     [WCT(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
         self.wct_ZCAPIv2_modules = nn.ModuleList(
-            [WCT_ZCAPIV2(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
+            [WCT_ZCAPIV2(input_dim, mask, n_group, training=training) for i in range(repeat_num + 1)])
 
     def forward(self, c_A, s_B):
-        whitening_reg = []
-        coloring_reg = []
-
         # Multi-hops
         for i, resblock in enumerate(self.resblocks):
             if i == 0:
-                c_A, cov, eigen_s = self.wct_ZCAPIv2_modules[i](c_A, s_B)
-                whitening_reg += [cov]
-                coloring_reg += [eigen_s]
+                c_A = self.wct_ZCAPIv2_modules[i](c_A, s_B)
 
             c_A = resblock(c_A)
-            c_A, cov, eigen_s = self.wct_ZCAPIv2_modules[i + 1](c_A, s_B)
-            whitening_reg += [cov]
-            coloring_reg += [eigen_s]
+            c_A = self.wct_ZCAPIv2_modules[i + 1](c_A, s_B)
 
-        # cov_reg: G,C//G,C//G
-        # W_reg: B*G,C//G,C//G
-        return c_A, whitening_reg, coloring_reg
+        return c_A
 
 
 class Content_Encoder(nn.Module):
@@ -465,15 +458,12 @@ class Transformer(nn.Module):
                  , device=None, is_training=True):
         super(Transformer, self).__init__()
         self.transformers = nn.ModuleList(
-            [Bottleneck(input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num // 2, device=device)
+            [Bottleneck(input_dim, mask, n_group, bias_dim, mlp_dim, repeat_num // 2, device=device, training=is_training)
              for i in range(n_styles)])
         self.n_styles = n_styles
         self.is_training = is_training
 
     def forward(self, c_A_list, s_B_list):
-        whitening_reg = None
-        coloring_reg = None
-
         if self.is_training:
             # take first feature only when training
             c_A = c_A_list[0]
@@ -482,7 +472,7 @@ class Transformer(nn.Module):
 
             for (i, v) in enumerate(style_label[0]):
                 if v:
-                    transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
+                    transformed = self.transformers[i](c_A, s_B)
                     transformed_feature = transformed
         else:
             transformed_feature = torch.zeros_like(c_A_list[0])
@@ -490,11 +480,10 @@ class Transformer(nn.Module):
                 s_B = s_B_dict[0]
                 style_label = s_B_dict[1]
                 for (i, v) in enumerate(style_label[0]):
-                    transformed, whitening_reg, coloring_reg = self.transformers[i](c_A, s_B)
+                    transformed = self.transformers[i](c_A, s_B)
                     transformed_feature += (transformed * v)
 
-        # return content transformed by style specific residual block
-        return transformed_feature, whitening_reg, coloring_reg
+        return transformed_feature
 
 
 class Decoder(nn.Module):
@@ -532,9 +521,9 @@ class Generator(nn.Module):
     def forward(self, content_list, style_dict_list):
         content_features = self.c_encoder(content_list)
         style_list = self.s_encoder(style_dict_list)
-        c_A, whitening_reg, coloring_reg = self.transformer(content_features, style_list)
+        c_A = self.transformer(content_features, style_list)
         output = self.decoder(c_A)
-        return output, whitening_reg, coloring_reg, content_features[0], style_list[0][0]
+        return output, content_features[0], style_list[0][0]
 
 
 class Discriminator(nn.Module):
@@ -623,8 +612,8 @@ if __name__ == '__main__':
     n_group = 8
     n_styles = 4
 
-    content = torch.rand((1, 3, 128, 128)).to(device)
-    style = torch.rand((1, 3, 128, 128)).to(device)
+    content = torch.rand((1, 3, 256, 256)).to(device)
+    style = torch.rand((1, 3, 256, 256)).to(device)
     label = torch.tensor([1, 0, 0, 0]).unsqueeze(0).to(device)
     style_dict = {'style': style, 'style_label': label}
     # The number of blocks in the coloring matrix: G, The number of elements for each block: n_members^2
@@ -656,24 +645,24 @@ if __name__ == '__main__':
     wct_feature = wct_ZCAPIv2_model(content_features[0], style_list[0][0])
     print('wct_feature inference:', wct_feature.size())
 
-    # c_A, whitening_reg, coloring_reg = transformer(content_features, style_list)
-    # print('c_A:', c_A.size())
-    #
-    # content_features = c_encoder([content, content])
-    # label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
-    # label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
-    # style_dict1 = {'style': style, 'style_label': label1}
-    # style_dict2 = {'style': style, 'style_label': label2}
-    # style_list = s_encoder([style_dict1, style_dict2])
-    # c_A_test, _, _ = transformer_test(content_features, style_list)
-    # print('c_A_test:', c_A_test.size())
+    c_A = transformer(content_features, style_list)
+    print('c_A:', c_A.size())
 
-    # output = decoder(c_A)
-    # print("decoder output:", output.size())
-    #
-    # generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
-    # output, _, _, _, _ = generator([content], [style_dict])
-    # print("generator output:", output.size())
+    content_features = c_encoder([content, content])
+    label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
+    label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
+    style_dict1 = {'style': style, 'style_label': label1}
+    style_dict2 = {'style': style, 'style_label': label2}
+    style_list = s_encoder([style_dict1, style_dict2])
+    c_A_test = transformer_test(content_features, style_list)
+    print('c_A_test:', c_A_test.size())
+
+    output = decoder(c_A)
+    print("decoder output:", output.size())
+
+    generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
+    output, _, _ = generator([content], [style_dict])
+    print("generator output:", output.size())
 
     # discriminator = Discriminator().to(device)
     # output_list = discriminator(output)
