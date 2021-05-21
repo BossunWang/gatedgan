@@ -51,7 +51,7 @@ def test(args):
 
     # models
     generator = Generator(args.n_styles, args.conv_dim, args.res_blocks_num, mask, args.n_group
-                          , args.mlp_dim, args.bias_dim, args.content_dim, is_training=True, device=device).to(device)
+                          , args.mlp_dim, args.bias_dim, args.content_dim, is_training=False, device=device).to(device)
     # generator = torch.nn.DataParallel(generator).to(device)
 
     checkpoint = torch.load(args.model_path, map_location=device)
@@ -132,15 +132,13 @@ def test(args):
 
                 style_dict_list.append(style_dict)
 
-            # mix style exclude ukiyoe
-            mix_count = 4
-            mix_rate = 0.33
+            # mix style
+            mix_count = args.n_styles
+            mix_rate = 1.0 / args.n_styles
             content_tensor_list = []
             for i, style_dict in enumerate(style_dict_list):
                 content_tensor_list.append(content_tensor)
                 style_dict_list[i]['style_label'] *= mix_rate
-
-            style_dict_list[2]['style_label'] *= 0.
 
             # mix first two style
             with torch.no_grad():
@@ -184,7 +182,7 @@ if __name__ == '__main__':
     conf.add_argument('--n_group', type=int, default=8,
                       help='The number of group for generator.')
     conf.add_argument('--img_scale', type=int, default=1)
-    conf.add_argument('--n_styles', type=int, default=4,
+    conf.add_argument('--n_styles', type=int, default=3,
                       help='The number of styles.')
     conf.add_argument('--model_path', type=str, default='',
                         help='where the checkpoint saved')

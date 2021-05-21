@@ -329,6 +329,59 @@ class WCT_ZCAPIV2(nn.Module):
         return styleize_B
 
 
+class WCT_RobustSVD(nn.Module):
+    def __init__(self, n_group, input_dim, w_alpha=0.4, eps=1e-5):
+        super(WCT_RobustSVD, self).__init__()
+        self.G = n_group
+        self.alpha = w_alpha
+        self.eps = eps
+        self.svdlayer = svdv2.apply
+
+    def forward(self, c_A, s_B):
+        return self.wct(c_A, s_B)
+
+    def group_feature_transform(self, x):
+        B, C, H, W = x.size()
+        n_mem = C // self.G  # 32 if G==8
+        xg = x.permute(1, 0, 2, 3).contiguous().view(self.G, n_mem, -1)  # B,C,H,W => C,B,H,W => G,C//G,BHW
+        xg_mean = torch.mean(xg, dim=2, keepdim=True)
+        xg = xg - xg_mean  # G,C//G,BHW
+
+        cov_xg = torch.bmm(xg, xg.permute(0, 2, 1)).div(B * H * W - 1) \
+                 + self.eps * torch.eye(n_mem).unsqueeze(0).to(xg.device)  # G,C//G,C//G
+
+        return xg, cov_xg, xg_mean
+
+    def wct(self, c_A, s_B):
+        N, C, H, W = c_A.size()
+        c_A_g, cov_c_A, c_A_mean = self.group_feature_transform(c_A)
+        s_B_g, cov_s_B, s_B_mean = self.group_feature_transform(s_B)
+
+        # print("c_A_g:", c_A_g.size())
+        # print("cov_c_A:", cov_c_A.size())
+        # print("s_B_g:", s_B_g.size())
+        # print("cov_s_B:", cov_s_B.size())
+
+        colored_B = torch.zeros_like(c_A_g).to(c_A.device)
+        for i in range(self.G):
+            c_A_v, c_A_e = self.svdlayer(cov_c_A[i])
+            s_B_v, s_B_e = self.svdlayer(cov_s_B[i])
+
+            # whitening
+            whitening = torch.mm(c_A_v, torch.diag(c_A_e.pow(-0.5)).mm(c_A_v.t()))
+            c_A_whitening_gi = torch.mm(whitening, c_A_g[i])
+
+            # coloring
+            coloring = torch.mm(s_B_v, torch.diag(s_B_e.pow(0.5)).mm(s_B_v.t()))
+            colored_B[i] = torch.mm(coloring, c_A_whitening_gi)
+
+        styleize_B = colored_B + s_B_mean.expand_as(colored_B)
+        styleize_B = styleize_B.view(C, N, H, W).transpose(0, 1)
+        # print('styleize_B:', styleize_B.size())
+
+        return styleize_B
+
+
 class WCT(nn.Module):
     def __init__(self, n_group, device, input_dim, mlp_dim, bias_dim, mask, w_alpha=0.4):
         super(WCT, self).__init__()
@@ -385,17 +438,17 @@ class Bottleneck(nn.Module):
             [ResidualBlock(dim=curr_dim, norm='none', n_group=n_group) for i in range(repeat_num)])
         # self.gdwct_modules = nn.ModuleList(
         #     [WCT(n_group, device, input_dim, mlp_dim, bias_dim, mask) for i in range(repeat_num + 1)])
-        self.wct_ZCAPIv2_modules = nn.ModuleList(
-            [WCT_ZCAPIV2(input_dim, mask, n_group, training=training) for i in range(repeat_num + 1)])
+        self.wct_RobustSVD_modules = nn.ModuleList(
+            [WCT_RobustSVD(n_group, input_dim) for i in range(repeat_num + 1)])
 
     def forward(self, c_A, s_B):
         # Multi-hops
         for i, resblock in enumerate(self.resblocks):
             if i == 0:
-                c_A = self.wct_ZCAPIv2_modules[i](c_A, s_B)
+                c_A = self.wct_RobustSVD_modules[i](c_A, s_B)
 
             c_A = resblock(c_A)
-            c_A = self.wct_ZCAPIv2_modules[i + 1](c_A, s_B)
+            c_A = self.wct_RobustSVD_modules[i + 1](c_A, s_B)
 
         return c_A
 
@@ -443,7 +496,7 @@ class Style_Encoder(nn.Module):
         # H/4,W/4,256, H/8,W/8,256, H/16,W/16,256
         for i in range(2):  # original: 2
             layers += [ConvBlock(curr_dim, curr_dim, 4, 2, 1, norm=norm, n_group=n_group, activation=activation)]
-        layers += [nn.AdaptiveAvgPool2d(1)]  # H/16,W/16,256 => 1,1,256
+        # layers += [nn.AdaptiveAvgPool2d(1)]  # H/16,W/16,256 => 1,1,256
 
         self.main = nn.Sequential(*layers)
         self.curr_dim = curr_dim
@@ -637,32 +690,29 @@ if __name__ == '__main__':
     print("style_feature:", style_list[0][0].size())
     print("style_label:", style_list[0][1].size())
 
-    wct_ZCAPIv2_model = WCT_ZCAPIV2(content_dim, mask, n_group).to(device)
-    wct_feature = wct_ZCAPIv2_model(content_features[0], style_list[0][0])
-    print('wct_feature:', wct_feature.size())
+    wct_model = WCT_RobustSVD(n_group, content_dim).to(device)
 
-    wct_ZCAPIv2_model_infer = WCT_ZCAPIV2(content_dim, mask, n_group, training=False).to(device)
-    wct_feature = wct_ZCAPIv2_model(content_features[0], style_list[0][0])
-    print('wct_feature inference:', wct_feature.size())
+    wct_feature = wct_model(content_features[0], style_list[0][0])
+    print('wct_feature:', wct_feature.size())
 
     c_A = transformer(content_features, style_list)
     print('c_A:', c_A.size())
-
-    content_features = c_encoder([content, content])
-    label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
-    label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
-    style_dict1 = {'style': style, 'style_label': label1}
-    style_dict2 = {'style': style, 'style_label': label2}
-    style_list = s_encoder([style_dict1, style_dict2])
-    c_A_test = transformer_test(content_features, style_list)
-    print('c_A_test:', c_A_test.size())
-
-    output = decoder(c_A)
-    print("decoder output:", output.size())
-
-    generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
-    output, _, _ = generator([content], [style_dict])
-    print("generator output:", output.size())
+    #
+    # content_features = c_encoder([content, content])
+    # label1 = torch.tensor([0.5, 0, 0, 0]).unsqueeze(0).to(device)
+    # label2 = torch.tensor([0, 0.5, 0, 0]).unsqueeze(0).to(device)
+    # style_dict1 = {'style': style, 'style_label': label1}
+    # style_dict2 = {'style': style, 'style_label': label2}
+    # style_list = s_encoder([style_dict1, style_dict2])
+    # c_A_test = transformer_test(content_features, style_list)
+    # print('c_A_test:', c_A_test.size())
+    #
+    # output = decoder(c_A)
+    # print("decoder output:", output.size())
+    #
+    # generator = Generator(n_styles, conv_dim, res_blocks_num, mask, n_group, mlp_dim, bias_dim, content_dim, device).to(device)
+    # output, _, _ = generator([content], [style_dict])
+    # print("generator output:", output.size())
 
     # discriminator = Discriminator().to(device)
     # output_list = discriminator(output)

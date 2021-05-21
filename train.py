@@ -341,7 +341,7 @@ if __name__ == '__main__':
                       help='The number of residual block for generator.')
     conf.add_argument('--n_group', type=int, default=8,
                       help='The number of group for generator.')
-    conf.add_argument('--n_styles', type=int, default=4,
+    conf.add_argument('--n_styles', type=int, default=3,
                       help='The number of styles.')
     conf.add_argument('--lambda_x_rec', type=float, default=10.,
                       help='The weight for auto encoder.')
